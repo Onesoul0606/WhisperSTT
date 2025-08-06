@@ -43,6 +43,10 @@ class LocalAgreementProcessor(
                            currentTime - lastProcessTime > (CHUNK_SIZE_SEC * 800) &&
                            !isProcessing
         
+        if (shouldProcess) {
+            Log.d(TAG, "🔍 Audio buffer: ${audioData.size} samples (${String.format("%.1f", audioLengthSec)}s), Previous buffer: ${previousBuffer.size} words")
+        }
+        
         if (!shouldProcess) return
         
         lastProcessTime = currentTime
@@ -50,10 +54,14 @@ class LocalAgreementProcessor(
         
         scope.launch {
             try {
-                Log.d(TAG, "Processing ${audioLengthSec}s for LocalAgreement")
+                val processingStartTime = System.currentTimeMillis()
+                Log.d(TAG, "🔄 Processing ${audioLengthSec}s for LocalAgreement")
                 
                 // 🎯 정확한 처리: prompt 사용, 최고 품질 설정
                 val prompt = generatePrompt()
+                Log.d(TAG, "📋 Using prompt: '${prompt.take(50)}${if (prompt.length > 50) "..." else ""}' (${prompt.length} chars)")
+                
+                val whisperStartTime = System.currentTimeMillis()
                 val result = if (prompt.isNotEmpty()) {
                     whisperSTT.transcribeWithContext(
                         audioData.map { (it * Short.MAX_VALUE).toInt().toShort() }.toShortArray(),
@@ -64,6 +72,10 @@ class LocalAgreementProcessor(
                         audioData.map { (it * Short.MAX_VALUE).toInt().toShort() }.toShortArray()
                     )
                 }
+                val whisperEndTime = System.currentTimeMillis()
+                val whisperDuration = whisperEndTime - whisperStartTime
+                
+                Log.d(TAG, "⏱️ Whisper processing took ${whisperDuration}ms for ${audioLengthSec}s audio (ratio: ${String.format("%.2f", whisperDuration / (audioLengthSec * 1000))})")
                 
                 if (result.isNotEmpty() && !result.startsWith("ERROR")) {
                     val newWords = parseToTimestampedWords(result, audioLengthSec)
@@ -77,8 +89,22 @@ class LocalAgreementProcessor(
                     }
                     
                     // 다음 비교를 위해 현재 결과를 버퍼에 저장
-                    previousBuffer.clear()
-                    previousBuffer.addAll(newWords)
+                    if (confirmedResults.isNotEmpty()) {
+                        // Agreement 성공한 경우: 버퍼 교체
+                        previousBuffer.clear()
+                        previousBuffer.addAll(newWords)
+                        Log.d(TAG, "🔄 Buffer updated after successful agreement")
+                    } else if (previousBuffer.isEmpty()) {
+                        // 첫 번째 결과인 경우: 무조건 저장
+                        previousBuffer.addAll(newWords)
+                        Log.d(TAG, "🔄 First result stored in buffer for future agreement")
+                        Log.d(TAG, "🔍 Buffer now contains: ${previousBuffer.map { it.text }}")
+                    } else {
+                        // Agreement 실패했지만 이전 버퍼가 있는 경우: 보존
+                        Log.d(TAG, "🔄 Agreement failed, keeping previous buffer for force confirm")
+                        Log.d(TAG, "🔍 Previous buffer preserved: ${previousBuffer.map { it.text }}")
+                        Log.d(TAG, "🔍 New words not agreed: ${newWords.map { it.text }}")
+                    }
                 }
                 
             } catch (e: Exception) {
@@ -92,6 +118,7 @@ class LocalAgreementProcessor(
     private fun performLocalAgreement(newWords: List<TimestampedWord>): List<TimestampedWord> {
         if (previousBuffer.isEmpty() || newWords.isEmpty()) {
             Log.d(TAG, "LocalAgreement: No previous buffer, storing current result")
+            Log.d(TAG, "🔍 First result stored: ${newWords.map { it.text }}")
             return emptyList() // 첫 번째 결과는 저장만 하고 확정하지 않음
         }
         
@@ -158,13 +185,25 @@ class LocalAgreementProcessor(
     
     fun forceConfirmPendingResults() {
         // 침묵 감지 시 대기 중인 결과들을 강제 확정
+        Log.d(TAG, "🔍 Force confirm called - previousBuffer size: ${previousBuffer.size}")
         if (previousBuffer.isNotEmpty()) {
             val forcedConfirmed = previousBuffer.toList()
             confirmedWords.addAll(forcedConfirmed)
             val confirmedText = forcedConfirmed.joinToString(" ") { it.text }
+            
+            // 🔬 고급 로깅 추가
+            AdvancedLoggingSystem.logResult(
+                AdvancedLoggingSystem.EventType.RESULT_CONFIRMED,
+                "LocalAgreement-ForceConfirm",
+                confirmedText,
+                0.9f
+            )
+            
             onConfirmedResult(confirmedText)
             Log.d(TAG, "Force confirmed due to silence: '$confirmedText'")
             previousBuffer.clear()
+        } else {
+            Log.w(TAG, "⚠️ Force confirm called but previousBuffer is empty!")
         }
     }
     
