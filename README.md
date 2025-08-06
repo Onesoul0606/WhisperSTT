@@ -39,7 +39,7 @@ app/src/main/
 
 1. 프로젝트 클론
 ```bash
-git clone https://github.com/YOUR_USERNAME/WhisperSTT.git
+git clone https://github.com/Onesoul0606/WhisperSTT.git
 cd WhisperSTT
 ```
 
