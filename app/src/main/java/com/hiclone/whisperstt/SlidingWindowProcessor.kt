@@ -3,96 +3,56 @@ package com.hiclone.whisperstt
 import android.util.Log
 import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentLinkedQueue
-import kotlin.math.abs
-import kotlin.math.sqrt
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SlidingWindowProcessor(
     private val whisperSTT: WhisperSTT,
-    private val onTranscriptionResult: (String) -> Unit
+    private val onResult: (String) -> Unit
 ) {
     companion object {
         private const val TAG = "SlidingWindowProcessor"
         private const val SAMPLE_RATE = 16000
-        
-        // 단어 단위 실시간 인식을 위한 슬라이딩 윈도우 설정
-        private const val STEP_MS = 500               // --step-ms 500 (0.5초 간격)
-        private const val LENGTH_MS = 1500            // --length-ms 1500 (1.5초 길이)
-        private const val KEEP_MS = 300               // --keep-ms 300 (0.3초 유지)
-        
-        private const val STEP_SECONDS = STEP_MS / 1000f
-        private const val LENGTH_SECONDS = LENGTH_MS / 1000f
-        private const val KEEP_SECONDS = KEEP_MS / 1000f
-        
-        private const val WINDOW_SIZE_SAMPLES = (SAMPLE_RATE * LENGTH_SECONDS).toInt()
-        private const val STEP_SAMPLES = (SAMPLE_RATE * STEP_SECONDS).toInt()
-        private const val KEEP_SAMPLES = (SAMPLE_RATE * KEEP_SECONDS).toInt()
-
-        // 개선된 VAD 임계값 - 더 엄격한 조건
-        private const val VOICE_THRESHOLD = 0.025f   // 0.015 → 0.025로 더 엄격하게
-        private const val MIN_VOICE_SAMPLES = SAMPLE_RATE / 4 // 0.125초 → 0.25초로 더 길게
-        private const val MIN_RMS_THRESHOLD = 0.03f  // 최소 RMS 임계값 추가
-        private const val MIN_VOICE_RATIO = 0.15f    // 최소 음성 비율 임계값 추가
+        private const val LENGTH_SECONDS = 3 // 3초 윈도우로 증가 (더 나은 정확도)
+        private const val WINDOW_SIZE_SAMPLES = SAMPLE_RATE * LENGTH_SECONDS
+        private const val SLIDE_SIZE_SAMPLES = SAMPLE_RATE * 1 // 1초씩 슬라이드
+        private const val MIN_PROCESSING_INTERVAL = 800L // 800ms 최소 간격 (더 빠른 응답)
+        private const val SILENCE_THRESHOLD = 0.015 // VAD 임계값 조정
     }
 
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val isRunning = AtomicBoolean(false)
+    private val isCurrentlyProcessing = AtomicBoolean(false)
     private val audioBuffer = ConcurrentLinkedQueue<Short>()
-    private var totalSamples = 0
-    private var processingJob: Job? = null
-    private var isProcessing = false
-    private val performanceMonitor = RealtimePerformanceMonitor() // 성능 모니터 추가
-    private var isCurrentlyProcessing = false // 중복 처리 방지
-    
-    // 중복 처리 방지를 위한 추가 변수들
     private var lastProcessedTime = 0L
-    private var lastTranscriptionResult = ""
-    private val MIN_PROCESSING_INTERVAL = 2000L // 2초 최소 간격
-
-    fun start() {
-        if (isProcessing) return
-
-        isProcessing = true
-        processingJob = CoroutineScope(Dispatchers.IO).launch {
-            processAudioLoop()
-        }
-        Log.i(TAG, "Sliding window processor started")
-    }
-
-    fun stop() {
-        isProcessing = false
-        processingJob?.cancel()
-        audioBuffer.clear()
-        totalSamples = 0
-        isCurrentlyProcessing = false
-        lastProcessedTime = 0L
-        lastTranscriptionResult = ""
-        Log.i(TAG, "Sliding window processor stopped")
-    }
+    private val performanceMonitor = RealtimePerformanceMonitor()
 
     fun addAudioData(audioData: ShortArray) {
-        // 새로운 오디오 데이터를 버퍼에 추가
+        if (!isRunning.get()) return
+
+        // 버퍼에 오디오 데이터 추가
         audioData.forEach { sample ->
             audioBuffer.offer(sample)
         }
-        totalSamples += audioData.size
-    }
 
-    private suspend fun processAudioLoop() {
-        while (isProcessing) {
-            try {
-                if (totalSamples >= WINDOW_SIZE_SAMPLES) {
-                    processWindow()
-                } else {
-                    delay(50) // 100ms → 50ms로 단축 (더 빠른 반응)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in processing loop", e)
-                delay(500) // 1000ms → 500ms로 단축
+        // 버퍼 크기 제한 (메모리 누수 방지)
+        while (audioBuffer.size > WINDOW_SIZE_SAMPLES * 2) {
+            audioBuffer.poll()
+        }
+
+        // 처리 조건 확인 (슬라이딩 윈도우 방식)
+        if (audioBuffer.size >= WINDOW_SIZE_SAMPLES && 
+            !isCurrentlyProcessing.get() &&
+            System.currentTimeMillis() - lastProcessedTime > MIN_PROCESSING_INTERVAL) {
+            
+            scope.launch {
+                processWindow()
             }
         }
     }
 
     private suspend fun processWindow() {
         // 중복 처리 방지
-        if (isCurrentlyProcessing) {
+        if (!isCurrentlyProcessing.compareAndSet(false, true)) {
             Log.d(TAG, "Already processing, skipping...")
             return
         }
@@ -101,114 +61,120 @@ class SlidingWindowProcessor(
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastProcessedTime < MIN_PROCESSING_INTERVAL) {
             Log.d(TAG, "Too soon since last processing, skipping...")
+            isCurrentlyProcessing.set(false)
             return
         }
 
-        // 윈도우 크기만큼 데이터 추출
-        val windowData = ShortArray(WINDOW_SIZE_SAMPLES)
-        val tempList = mutableListOf<Short>()
+        try {
+            // 슬라이딩 윈도우 방식으로 데이터 추출
+            val windowData = ShortArray(WINDOW_SIZE_SAMPLES)
+            val tempList = mutableListOf<Short>()
 
-        // ConcurrentLinkedQueue에서 윈도우 크기만큼 데이터 가져오기
-        for (i in 0 until WINDOW_SIZE_SAMPLES) {
-            val sample = audioBuffer.poll()
-            if (sample != null) {
-                tempList.add(sample)
+            // 윈도우 크기만큼 데이터 가져오기 (슬라이딩을 위해 일부 보존)
+            val bufferSnapshot = audioBuffer.toList()
+            
+            if (bufferSnapshot.size < WINDOW_SIZE_SAMPLES) {
+                isCurrentlyProcessing.set(false)
+                return
+            }
+            
+            // 윈도우 데이터 복사
+            bufferSnapshot.take(WINDOW_SIZE_SAMPLES).toShortArray().copyInto(windowData)
+            
+            // 슬라이딩: SLIDE_SIZE만큼 제거 (나머지는 다음 윈도우를 위해 보존)
+            repeat(minOf(SLIDE_SIZE_SAMPLES, audioBuffer.size)) {
+                audioBuffer.poll()
+            }
+
+            // 중지 상태 확인
+            if (!isRunning.get()) return
+            
+            // 개선된 VAD 체크
+            if (hasVoiceActivity(windowData)) {
+                Log.d(TAG, "Voice detected, processing ${LENGTH_SECONDS}s window...")
+                
+                // 중지 상태 다시 확인
+                if (!isRunning.get()) return
+                
+                lastProcessedTime = currentTime
+                
+                try {
+                    // 성능 모니터와 함께 Whisper 처리
+                    val result = performanceMonitor.recordProcessing(LENGTH_SECONDS.toFloat()) {
+                        withContext(Dispatchers.IO) {
+                            // 처리 전에도 중지 상태 확인
+                            if (!isRunning.get()) return@withContext ""
+                            whisperSTT.transcribeAudioSync(windowData)
+                        }
+                    }
+
+                    // 결과 처리 전에도 중지 상태 확인
+                    if (result.isNotEmpty() && !result.startsWith("ERROR") && isRunning.get()) {
+                        onResult(result)
+                        Log.d(TAG, "Transcription result: $result")
+                    } else {
+                        Log.d(TAG, "Empty or error result: $result")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during transcription", e)
+                }
             } else {
-                break
+                Log.d(TAG, "No voice activity detected, skipping...")
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in processWindow", e)
+        } finally {
+            isCurrentlyProcessing.set(false)
         }
-
-        if (tempList.size < WINDOW_SIZE_SAMPLES) {
-            // 데이터가 부족하면 다시 큐에 넣고 대기
-            tempList.forEach { audioBuffer.offer(it) }
-            return
-        }
-
-        tempList.toShortArray().copyInto(windowData)
-
-        // 개선된 VAD 체크
-        if (hasVoiceActivity(windowData)) {
-            Log.d(TAG, "Voice detected, processing ${LENGTH_SECONDS}s window...")
-            
-            isCurrentlyProcessing = true
-            lastProcessedTime = currentTime
-            
-            try {
-                // 성능 모니터와 함께 Whisper 처리
-                val result = performanceMonitor.recordProcessing(LENGTH_SECONDS.toFloat()) {
-                    withContext(Dispatchers.IO) {
-                        whisperSTT.transcribeAudioSync(windowData)
-                    }
-                }
-
-                // 결과 필터링 및 중복 방지
-                if (result.isNotEmpty() && result != "[BLANK_AUDIO]" && result != lastTranscriptionResult) {
-                    Log.i(TAG, "Transcription result: $result")
-                    lastTranscriptionResult = result
-                    withContext(Dispatchers.Main) {
-                        onTranscriptionResult(result)
-                    }
-                } else if (result == "[BLANK_AUDIO]") {
-                    Log.d(TAG, "Blank audio detected, skipping result")
-                } else if (result == lastTranscriptionResult) {
-                    Log.d(TAG, "Duplicate result detected, skipping")
-                }
-            } finally {
-                isCurrentlyProcessing = false
-            }
-        } else {
-            Log.d(TAG, "No voice activity detected, skipping...")
-        }
-
-        // keep 부분을 다시 큐에 넣기 (문서 기준)
-        val keepData = windowData.takeLast(KEEP_SAMPLES)
-        keepData.forEach { audioBuffer.offer(it) }
-
-        // 전체 샘플 수 업데이트 (step 크기만큼 감소)
-        totalSamples -= STEP_SAMPLES
     }
 
     private fun hasVoiceActivity(audioData: ShortArray): Boolean {
         if (audioData.isEmpty()) return false
 
-        // 개선된 VAD 알고리즘 (문서 기준 --vad-thold 0.5 적용)
-        val sampleStep = 2 // 2개 중 1개만 계산 (더 정확한 분석)
-        var sum = 0.0
-        var voiceSamples = 0
-        var totalSampled = 0
-        var maxAmplitude = 0.0
-
-        for (i in audioData.indices step sampleStep) {
-            val normalized = audioData[i].toDouble() / Short.MAX_VALUE
-            sum += normalized * normalized
+        try {
+            // 간단한 VAD: RMS 기반 음성 활동 감지
+            var sum = 0.0
+            var count = 0
             
-            val absValue = kotlin.math.abs(normalized)
-            if (absValue > maxAmplitude) {
-                maxAmplitude = absValue
+            for (sample in audioData) {
+                val amplitude = sample.toDouble() / Short.MAX_VALUE
+                sum += amplitude * amplitude
+                count++
             }
+            
+            if (count == 0) return false
+            
+            val rms = Math.sqrt(sum / count)
+            
+            return rms > SILENCE_THRESHOLD
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in VAD calculation", e)
+            return false
+        }
+    }
 
-            if (absValue > VOICE_THRESHOLD) {
-                voiceSamples++
+    fun start() {
+        if (isRunning.compareAndSet(false, true)) {
+            Log.d(TAG, "Started")
+        }
+    }
+
+    fun stop() {
+        if (isRunning.compareAndSet(true, false)) {
+            audioBuffer.clear()
+            
+            // 현재 처리 중인 작업 완료 대기 (짧은 시간)
+            var waitCount = 0
+            while (isCurrentlyProcessing.get() && waitCount < 10) {
+                Thread.sleep(50) // 50ms씩 최대 500ms 대기
+                waitCount++
             }
-            totalSampled++
+            
+            // 즉시 모든 코루틴 취소
+            scope.cancel()
+            
+            Log.d(TAG, "Stopped")
         }
-
-        val rms = sqrt(sum / totalSampled)
-        val voiceRatio = voiceSamples.toFloat() / totalSampled
-
-        // 개선된 VAD 조건 - 더 엄격한 조건들
-        val hasVoice = rms > MIN_RMS_THRESHOLD && 
-                      voiceRatio > MIN_VOICE_RATIO && 
-                      maxAmplitude > VOICE_THRESHOLD * 1.2f &&
-                      voiceSamples > MIN_VOICE_SAMPLES
-
-        if (hasVoice) {
-            Log.d(TAG, "VAD: RMS=${String.format("%.4f", rms)}, VoiceRatio=${String.format("%.3f", voiceRatio)}, MaxAmp=${String.format("%.4f", maxAmplitude)}, HasVoice=true")
-        } else {
-            Log.d(TAG, "VAD: RMS=${String.format("%.4f", rms)}, VoiceRatio=${String.format("%.3f", voiceRatio)}, MaxAmp=${String.format("%.4f", maxAmplitude)}, HasVoice=false")
-        }
-
-        return hasVoice
     }
 
     fun release() {

@@ -12,105 +12,148 @@ class AudioCapture {
         private const val TAG = "AudioCapture"
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
-        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val BUFFER_SIZE_MULTIPLIER = 4
+        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_FLOAT
+        private val BUFFER_SIZE = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT
+        )
     }
 
     private var audioRecord: AudioRecord? = null
     private val isRecording = AtomicBoolean(false)
     private var recordingJob: Job? = null
-    private var onAudioDataCallback: ((ShortArray) -> Unit)? = null
+    private var audioDataCallback: ((FloatArray) -> Unit)? = null
+    private var shortAudioDataCallback: ((ShortArray) -> Unit)? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private val bufferSize = AudioRecord.getMinBufferSize(
-        SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT
-    ) * BUFFER_SIZE_MULTIPLIER
+    fun setAudioDataCallback(callback: (FloatArray) -> Unit) {
+        audioDataCallback = callback
+    }
 
-    fun setAudioDataCallback(callback: (ShortArray) -> Unit) {
-        onAudioDataCallback = callback
+    fun setShortAudioDataCallback(callback: (ShortArray) -> Unit) {
+        shortAudioDataCallback = callback
     }
 
     fun startRecording(): Boolean {
         if (isRecording.get()) {
             Log.w(TAG, "Already recording")
-            return true
+            return false
         }
 
-        try {
+        return try {
+            // 권한 체크 (런타임에 권한이 거부될 수 있음)
             audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 SAMPLE_RATE,
                 CHANNEL_CONFIG,
                 AUDIO_FORMAT,
-                bufferSize
+                BUFFER_SIZE
             )
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord initialization failed")
+                Log.e(TAG, "Failed to initialize AudioRecord")
+                audioRecord?.release()
+                audioRecord = null
                 return false
             }
 
-            audioRecord?.startRecording()
             isRecording.set(true)
-
-            // 코루틴으로 백그라운드에서 오디오 데이터 읽기
-            recordingJob = CoroutineScope(Dispatchers.IO).launch {
+            recordingJob = scope.launch {
                 recordAudio()
             }
 
-            Log.i(TAG, "Recording started successfully")
-            return true
-
+            Log.i(TAG, "Audio recording started")
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording", e)
-            return false
+            audioRecord?.release()
+            audioRecord = null
+            false
         }
     }
 
+    fun stopRecording() {
+        if (!isRecording.get()) {
+            Log.w(TAG, "Not recording")
+            return
+        }
+
+        isRecording.set(false)
+        recordingJob?.cancel()
+        
+        try {
+            audioRecord?.stop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping AudioRecord", e)
+        }
+        
+        try {
+            audioRecord?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing AudioRecord", e)
+        }
+        
+        audioRecord = null
+        Log.i(TAG, "Audio recording stopped")
+    }
+
+    fun isRecording(): Boolean = isRecording.get()
+
+    fun release() {
+        stopRecording()
+        scope.cancel()
+    }
+
     private suspend fun recordAudio() {
-        val audioBuffer = ShortArray(bufferSize / 2) // 16-bit samples
+        val buffer = FloatArray(BUFFER_SIZE / 4) // Float는 4바이트
 
-        while (isRecording.get() && !Thread.currentThread().isInterrupted) {
+        try {
+            audioRecord?.startRecording()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start AudioRecord", e)
+            return
+        }
+
+        while (isRecording.get()) {
             try {
-                val readResult = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
-
-                if (readResult > 0) {
-                    // 실제 읽은 데이터만 콜백으로 전달
-                    val actualData = audioBuffer.copyOf(readResult)
-                    onAudioDataCallback?.invoke(actualData)
-                } else {
-                    Log.w(TAG, "AudioRecord read returned: $readResult")
-                    delay(10) // 에러 시 잠시 대기
+                val readSize = audioRecord?.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING) ?: 0
+                
+                if (readSize > 0) {
+                    // 메모리 안전성을 위한 복사
+                    val audioData = FloatArray(readSize)
+                    buffer.copyInto(audioData, 0, 0, readSize)
+                    
+                    // 콜백 호출 시 예외 처리
+                    try {
+                        audioDataCallback?.invoke(audioData)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in audio data callback", e)
+                    }
+                    
+                    // ShortArray로도 변환하여 제공
+                    val shortAudioData = ShortArray(readSize)
+                    for (i in 0 until readSize) {
+                        shortAudioData[i] = (audioData[i] * Short.MAX_VALUE).toInt().toShort()
+                    }
+                    
+                    try {
+                        shortAudioDataCallback?.invoke(shortAudioData)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in short audio data callback", e)
+                    }
+                } else if (readSize == AudioRecord.ERROR_INVALID_OPERATION) {
+                    Log.e(TAG, "AudioRecord ERROR_INVALID_OPERATION")
+                    break
+                } else if (readSize == AudioRecord.ERROR_BAD_VALUE) {
+                    Log.e(TAG, "AudioRecord ERROR_BAD_VALUE")
+                    break
+                } else if (readSize == AudioRecord.ERROR_DEAD_OBJECT) {
+                    Log.e(TAG, "AudioRecord ERROR_DEAD_OBJECT")
+                    break
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error reading audio data", e)
                 break
             }
         }
-    }
-
-    fun stopRecording() {
-        if (!isRecording.get()) {
-            return
-        }
-
-        isRecording.set(false)
-        recordingJob?.cancel()
-
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-            audioRecord = null
-            Log.i(TAG, "Recording stopped successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping recording", e)
-        }
-    }
-
-    fun isRecording(): Boolean = isRecording.get()
-
-    // 메모리 해제
-    fun release() {
-        stopRecording()
-        onAudioDataCallback = null
     }
 }

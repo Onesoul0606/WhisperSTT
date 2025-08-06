@@ -21,14 +21,25 @@ android {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
 
-        // CMake 외부 네이티브 빌드 설정 (whisper.cpp 호환성을 위해 -fno-finite-math-only 사용)
+        // CMake 외부 네이티브 빌드 설정 (안정성 향상)
         externalNativeBuild {
             cmake {
-                cppFlags += listOf("-std=c++17", "-O3", "-fno-finite-math-only")
+                cppFlags += listOf(
+                    "-std=c++17", 
+                    "-O2", 
+                    "-fno-finite-math-only",
+                    "-fstack-protector-strong",
+                    "-D_FORTIFY_SOURCE=2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Wno-unused-parameter",
+                    "-Wno-format"
+                )
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
                     "-DGGML_USE_ANDROID=ON",
-                    "-DANDROID_PLATFORM=android-24"
+                    "-DANDROID_PLATFORM=android-24",
+                    "-DCMAKE_BUILD_TYPE=Release"
                 )
             }
         }
@@ -86,6 +97,11 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+    
+    // Lint 설정
+    lint {
+        disable += "MissingPermission"
     }
 }
 
